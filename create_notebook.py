@@ -1,0 +1,1649 @@
+#!/usr/bin/env python3
+"""
+Generate Lab 5 Jupyter Notebook: Text Classification with RNN, LSTM, GRU
+Student ID: 029 → BBC News (29%5=4), Units=32/Dense=128 (29%4=1)
+"""
+import json
+
+def md(source):
+    return {"cell_type": "markdown", "metadata": {}, "source": source}
+
+def code(source):
+    return {"cell_type": "code", "metadata": {}, "source": source, "outputs": [], "execution_count": None}
+
+cells = []
+
+# ============================================================
+# TITLE
+# ============================================================
+cells.append(md(
+"""# 🧠 Lab 5: Text Classification with RNN, LSTM and GRU
+## นักศึกษา: เลขที่ 029
+
+| รายการ | ค่า |
+|--------|-----|
+| **เลขท้าย 2 ตัว** | 29 |
+| **29 % 5 = 4** | Dataset: **BBC News** (5 Classes) |
+| **29 % 4 = 1** | Recurrent Units = **32**, Dense Units = **128** |
+
+### Architecture (%4 = 1)
+```
+Embedding(10000, 64)
+    ↓
+SimpleRNN / LSTM / GRU (32)
+    ↓
+Dropout(0.20)
+    ↓
+Dense(128, ReLU)
+    ↓
+Dropout(0.30)
+    ↓
+Dense(5, Softmax)
+```
+
+### Pipeline
+```
+Text Dataset → Tokenization → Padding → Embedding → RNN/LSTM/GRU → Classification → Evaluation
+```
+"""
+))
+
+# ============================================================
+# 1. SETUP & SPEED OPTIMIZATION
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 1: ติดตั้ง Libraries และ Optimize ความเร็ว (CPU/GPU/RAM)
+
+ขั้นตอนนี้เราจะ:
+- ติดตั้ง library ที่จำเป็น
+- ตั้งค่า GPU/CPU ให้ใช้งานได้เต็มประสิทธิภาพ
+- เปิด XLA Compiler เพื่อเร่งการคำนวณ
+- ตั้งค่า Threading สำหรับ CPU ให้ใช้ทุก core
+- ใช้ `tf.data` pipeline ที่มี `.cache()` และ `.prefetch()` เพื่อลด I/O bottleneck
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# ติดตั้ง Libraries ที่จำเป็น
+# ============================================================
+!pip install -q scikit-learn matplotlib seaborn pandas numpy psutil
+import os
+import sys
+import psutil
+import re
+import time
+import warnings
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# 🚀 SPEED OPTIMIZATION: ใช้ทรัพยากร CPU/GPU/RAM ให้เต็มที่
+# ============================================================
+
+# 1) ตั้งค่า GPU - ให้ใช้ memory แบบ dynamic (ไม่จองทั้งหมดตั้งแต่แรก)
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    print(f"✅ GPU พร้อมใช้งาน: {len(gpus)} ตัว")
+    for gpu in gpus:
+        print(f"   - {gpu.name}")
+else:
+    print("⚠️ ไม่พบ GPU → ใช้ CPU (ปกติสำหรับ Windows)")
+
+# 2) ตั้งค่า CPU Threading - ใช้ทุก core ที่มี
+num_cores = os.cpu_count()
+tf.config.threading.set_intra_op_parallelism_threads(num_cores)
+tf.config.threading.set_inter_op_parallelism_threads(num_cores)
+print(f"✅ CPU Cores: {num_cores} (ใช้ทั้งหมด)")
+
+# 3) เปิด XLA (Accelerated Linear Algebra) Compiler - เร่งการคำนวณ
+try:
+    tf.config.optimizer.set_jit(True)
+    print("✅ XLA JIT Compiler: เปิดใช้งาน")
+except Exception:
+    print("⚠️ XLA JIT ไม่รองรับบนระบบนี้ → ข้ามไป")
+
+# 4) แสดงข้อมูลระบบ
+print(f"\\n📊 System Info:")
+print(f"   TensorFlow version: {tf.__version__}")
+print(f"   Python version: {sys.version}")
+print(f"   RAM available: {psutil.virtual_memory().available / (1024**2):.0f} MB")
+"""
+))
+
+# ============================================================
+# 2. LOAD DATASET (BBC News)
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 2: Dataset ที่ได้รับ — BBC News
+
+**BBC News Dataset** เป็นชุดข้อมูลข่าว BBC จำนวนประมาณ 2,225 บทความ แบ่งเป็น 5 หมวดหมู่:
+
+| Class | หมวดหมู่ | คำอธิบาย |
+|-------|---------|----------|
+| 0 | business | ข่าวธุรกิจ |
+| 1 | entertainment | ข่าวบันเทิง |
+| 2 | politics | ข่าวการเมือง |
+| 3 | sport | ข่าวกีฬา |
+| 4 | tech | ข่าวเทคโนโลยี |
+
+- **ประเภทงาน**: News Classification (Multi-class)
+- **จำนวน Classes**: 5
+- **Input**: Text (บทความข่าว)
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# โหลด BBC News Dataset
+# ============================================================
+
+# โหลด BBC News จาก CSV (เร็วและเสถียรกว่า HuggingFace)
+print("📥 กำลังโหลด BBC News Dataset...")
+
+try:
+    url = "https://raw.githubusercontent.com/mdsohaib/BBC-News-Classification/master/bbc-text.csv"
+    df = pd.read_csv(url)
+    print("✅ โหลดจาก GitHub สำเร็จ!")
+except Exception:
+    try:
+        url = "https://storage.googleapis.com/dataset-uploader/bbc/bbc-text.csv"
+        df = pd.read_csv(url)
+        print("✅ โหลดจาก Google Storage สำเร็จ!")
+    except Exception as e:
+        print(f"❌ โหลดไม่สำเร็จ: {e}")
+        print("💡 ลองดาวน์โหลดไฟล์ bbc-text.csv มาใส่ในโฟลเดอร์เดียวกัน")
+        raise
+
+# ตรวจสอบ columns - ปรับชื่อให้เป็นมาตรฐาน
+if 'category' not in df.columns:
+    # อาจมีชื่อ column ต่างกัน
+    possible_cat_cols = [c for c in df.columns if c.lower() in ['category', 'label', 'label_text', 'class']]
+    possible_text_cols = [c for c in df.columns if c.lower() in ['text', 'content', 'article']]
+    if possible_cat_cols:
+        df = df.rename(columns={possible_cat_cols[0]: 'category'})
+    if possible_text_cols:
+        df = df.rename(columns={possible_text_cols[0]: 'text'})
+
+# สร้าง label mapping (แปลงจากชื่อหมวดเป็นตัวเลข)
+# เรียงลำดับตัวอักษร: business=0, entertainment=1, politics=2, sport=3, tech=4
+label_names = sorted(df['category'].unique())
+label_to_id = {name: i for i, name in enumerate(label_names)}
+id_to_label = {i: name for name, i in label_to_id.items()}
+
+df['label'] = df['category'].map(label_to_id)
+
+# ============================================================
+# แสดงข้อมูลทั่วไปของ Dataset
+# ============================================================
+print("=" * 60)
+print("📊 BBC News Dataset Summary")
+print("=" * 60)
+print(f"  Dataset Name       : BBC News")
+print(f"  Number of Classes  : {len(label_names)}")
+print(f"  Number of Samples  : {len(df)}")
+print(f"  Classes            : {label_names}")
+print(f"  Label Mapping      : {label_to_id}")
+print(f"  Columns            : {list(df.columns)}")
+print("=" * 60)
+df.head()
+"""
+))
+
+# ============================================================
+# 3. จำนวน Classes & Distribution
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 3: จำนวน Classes และการกระจายตัวของข้อมูล
+
+แสดงจำนวนข้อมูลในแต่ละ class เพื่อตรวจสอบว่า dataset มี class imbalance หรือไม่
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# แสดงจำนวนข้อมูลแต่ละ Class
+# ============================================================
+class_counts = df['category'].value_counts()
+print("📊 จำนวนข้อมูลแต่ละ Class:")
+print("-" * 40)
+for cat, count in class_counts.items():
+    print(f"  {cat:15s} : {count:5d} ({count/len(df)*100:.1f}%)")
+print("-" * 40)
+print(f"  {'Total':15s} : {len(df):5d}")
+
+# แสดงกราฟ
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Bar chart
+colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+bars = axes[0].bar(class_counts.index, class_counts.values, color=colors, edgecolor='black', linewidth=0.5)
+axes[0].set_title('จำนวนข้อมูลแต่ละ Class', fontsize=14, fontweight='bold')
+axes[0].set_xlabel('Category')
+axes[0].set_ylabel('Count')
+for bar, count in zip(bars, class_counts.values):
+    axes[0].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 5,
+                 str(count), ha='center', va='bottom', fontweight='bold')
+
+# Pie chart
+axes[1].pie(class_counts.values, labels=class_counts.index, autopct='%1.1f%%',
+            colors=colors, startangle=90, explode=[0.02]*5)
+axes[1].set_title('สัดส่วนข้อมูลแต่ละ Class', fontsize=14, fontweight='bold')
+
+plt.tight_layout()
+plt.show()
+"""
+))
+
+# ============================================================
+# 4. ตัวอย่างข้อมูล Text
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 4: ตัวอย่างข้อมูล Text
+
+แสดงตัวอย่างข้อมูลอย่างน้อย 5 ตัวอย่าง พร้อม Class Label
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# แสดงตัวอย่างข้อมูล 5 ตัวอย่าง (1 ตัวอย่างจากแต่ละ class)
+# ============================================================
+print("📝 ตัวอย่างข้อมูลจากแต่ละ Class:")
+print("=" * 80)
+
+for label_name in label_names:
+    sample = df[df['category'] == label_name].iloc[0]
+    text_preview = sample['text'][:200] + "..." if len(sample['text']) > 200 else sample['text']
+    print(f"\\n🏷️  Class: {label_name.upper()} (Label: {label_to_id[label_name]})")
+    print(f"   Text : {text_preview}")
+    print("-" * 80)
+
+# แสดงสถิติความยาวของ text
+text_lengths = df['text'].apply(lambda x: len(x.split()))
+print(f"\\n📏 สถิติความยาว Text (จำนวนคำ):")
+print(f"   Min    : {text_lengths.min()}")
+print(f"   Max    : {text_lengths.max()}")
+print(f"   Mean   : {text_lengths.mean():.1f}")
+print(f"   Median : {text_lengths.median():.1f}")
+
+# Histogram ความยาว
+plt.figure(figsize=(10, 4))
+plt.hist(text_lengths, bins=50, color='#45B7D1', edgecolor='black', alpha=0.7)
+plt.axvline(x=200, color='red', linestyle='--', label='MAX_LENGTH=200')
+plt.title('Distribution of Text Length (จำนวนคำ)', fontsize=14, fontweight='bold')
+plt.xlabel('Number of Words')
+plt.ylabel('Frequency')
+plt.legend()
+plt.tight_layout()
+plt.show()
+"""
+))
+
+# ============================================================
+# 5. Text Preprocessing
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 5: Text Preprocessing (การเตรียมข้อมูลข้อความ)
+
+กระบวนการเตรียมข้อมูลข้อความมีขั้นตอนดังนี้:
+
+```
+Raw Text → Cleaning → Tokenization → Vocabulary → Sequence Encoding → Padding → Train/Val/Test
+```
+
+### Text Cleaning ทำอะไรบ้าง:
+1. **แปลงเป็นตัวเล็ก** (lowercase) - เพื่อให้ "The" กับ "the" เป็นคำเดียวกัน
+2. **ลบ HTML tags** - ลบ tag ที่ไม่ต้องการ
+3. **ลบอักขระพิเศษ** - เก็บเฉพาะตัวอักษรและตัวเลข
+4. **ลบ whitespace ที่เกิน** - ลดช่องว่างซ้ำ
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# Text Cleaning: ทำความสะอาดข้อความ
+# ============================================================
+
+def clean_text(text):
+    \"\"\"
+    ฟังก์ชันทำความสะอาดข้อความ:
+    1. แปลงเป็นตัวพิมพ์เล็ก (lowercase)
+    2. ลบ HTML tags
+    3. ลบอักขระพิเศษ เก็บเฉพาะตัวอักษรและตัวเลข
+    4. ลบ whitespace ที่ซ้ำ
+    \"\"\"
+    text = text.lower()                           # แปลงเป็นตัวเล็ก
+    text = re.sub(r'<[^>]+>', '', text)           # ลบ HTML tags
+    text = re.sub(r'[^a-zA-Z0-9\\s]', '', text)   # ลบอักขระพิเศษ
+    text = re.sub(r'\\s+', ' ', text).strip()      # ลบช่องว่างซ้ำ
+    return text
+
+# ทำความสะอาดข้อความทั้งหมด
+df['cleaned_text'] = df['text'].apply(clean_text)
+
+# แสดงตัวอย่างก่อน-หลัง cleaning
+print("🧹 ตัวอย่าง Text Cleaning:")
+print("=" * 80)
+for i in range(3):
+    print(f"\\n📌 ตัวอย่างที่ {i+1}:")
+    print(f"  Before: {df['text'].iloc[i][:150]}...")
+    print(f"  After : {df['cleaned_text'].iloc[i][:150]}...")
+    print("-" * 80)
+"""
+))
+
+# ============================================================
+# 6. Tokenization
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 6: Tokenization (การแปลงข้อความเป็นตัวเลข)
+
+**Tokenization** คือกระบวนการแปลงข้อความ (text) ให้เป็นลำดับของตัวเลข (sequence of integers) โดย:
+1. สร้าง **Vocabulary** (พจนานุกรมคำ) จาก training data
+2. แปลงแต่ละคำเป็น **integer ID** ตาม vocabulary
+3. คำที่ไม่อยู่ใน vocabulary จะถูกแทนที่ด้วย **OOV (Out-of-Vocabulary) token**
+
+### ตัวอย่าง:
+```
+"I really like this movie"
+    ↓ Tokenization
+[11, 45, 87, 23, 91]
+```
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# กำหนด Hyperparameters สำหรับ Tokenization
+# ============================================================
+
+# จำกัดจำนวนคำที่ใช้ใน Vocabulary (เลือกคำที่พบบ่อยที่สุด 10,000 คำ)
+VOCAB_SIZE = 10000
+
+# กำหนดความยาวสูงสุดของ Sequence (ตัด/เพิ่ม padding ให้ทุก sequence มีความยาวเท่ากัน)
+MAX_LENGTH = 200
+
+# กำหนดขนาด Embedding Dimension (แต่ละคำจะถูกแทนด้วย vector ขนาดนี้)
+EMBEDDING_DIM = 64
+
+# Batch size สำหรับ training (ยิ่งใหญ่ยิ่งเร็ว แต่ใช้ RAM มาก)
+BATCH_SIZE = 64
+
+# จำนวน Epochs
+EPOCHS = 15
+
+print(f"📋 Hyperparameters:")
+print(f"   VOCAB_SIZE     = {VOCAB_SIZE}")
+print(f"   MAX_LENGTH     = {MAX_LENGTH}")
+print(f"   EMBEDDING_DIM  = {EMBEDDING_DIM}")
+print(f"   BATCH_SIZE     = {BATCH_SIZE}")
+print(f"   EPOCHS         = {EPOCHS}")
+"""
+))
+
+# ============================================================
+# 7. Vocabulary & Padding
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 7: Vocabulary และ Padding
+
+### Vocabulary
+- สร้างพจนานุกรมคำจาก **training data เท่านั้น** (ไม่ใช้ validation/test)
+- จำกัดไว้ที่ `VOCAB_SIZE = 10000` คำที่พบบ่อยที่สุด
+- คำที่ไม่อยู่ใน vocabulary จะถูกแทนด้วย `<OOV>` (Out-of-Vocabulary) token
+
+### Padding
+- ทำให้ทุก sequence มีความยาวเท่ากันที่ `MAX_LENGTH = 200`
+- sequence ที่สั้นกว่า → เติม 0 ต่อท้าย (post-padding)
+- sequence ที่ยาวกว่า → ตัดส่วนท้ายออก (post-truncating)
+
+```
+"I really like this movie"
+    ↓ Tokenization
+[11, 45, 87, 23, 91]
+    ↓ Padding (MAX_LENGTH=8)
+[11, 45, 87, 23, 91, 0, 0, 0]
+```
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# Train / Validation / Test Split (ต้องแบ่งก่อน Tokenization!)
+# ============================================================
+# ⚠️ สำคัญ: ต้องแบ่งข้อมูลก่อน fit tokenizer เพื่อป้องกัน data leakage
+# Training 70% / Validation 15% / Testing 15%
+
+# แปลงเป็นมาตรฐาน Python list และ Numpy array 
+# (ป้องกันปัญหา PyArrow TypeError ใน Pandas เวอร์ชันใหม่ๆ)
+texts = df['cleaned_text'].astype(str).tolist()
+labels = np.array(df['label'].tolist(), dtype=int)
+
+# แบ่งครั้งที่ 1: Train (70%) vs Temp (30%)
+X_train, X_temp, y_train, y_temp = train_test_split(
+    texts, labels, test_size=0.30, random_state=42, stratify=labels
+)
+
+# แบ่งครั้งที่ 2: Temp → Validation (15%) + Test (15%)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.50, random_state=42, stratify=y_temp
+)
+
+print(f"📊 Data Split:")
+print(f"   Training   : {len(X_train):,} samples ({len(X_train)/len(texts)*100:.1f}%)")
+print(f"   Validation : {len(X_val):,} samples ({len(X_val)/len(texts)*100:.1f}%)")
+print(f"   Testing    : {len(X_test):,} samples ({len(X_test)/len(texts)*100:.1f}%)")
+print(f"   Total      : {len(texts):,} samples")
+
+# ============================================================
+# Tokenization: สร้าง Vocabulary และแปลง Text เป็น Sequence
+# ============================================================
+# ใช้ Keras Tokenizer - fit เฉพาะ training data เท่านั้น!
+tokenizer = tf.keras.preprocessing.text.Tokenizer(
+    num_words=VOCAB_SIZE,    # จำกัดจำนวนคำใน vocabulary
+    oov_token="<OOV>"        # token สำหรับคำที่ไม่รู้จัก
+)
+
+# fit tokenizer บน training data เท่านั้น (ป้องกัน data leakage)
+tokenizer.fit_on_texts(X_train)
+
+# แปลง text เป็น sequence ของตัวเลข
+train_sequences = tokenizer.texts_to_sequences(X_train)
+val_sequences = tokenizer.texts_to_sequences(X_val)
+test_sequences = tokenizer.texts_to_sequences(X_test)
+
+# แสดงตัวอย่าง tokenization
+print(f"\\n🔤 Vocabulary Info:")
+print(f"   Total unique words : {len(tokenizer.word_index):,}")
+print(f"   Vocabulary size    : {VOCAB_SIZE}")
+print(f"   OOV token          : '<OOV>' (ID: {tokenizer.word_index.get('<OOV>', 'N/A')})")
+
+print(f"\\n📝 ตัวอย่าง Tokenization:")
+for i in range(2):
+    print(f"   Text    : {X_train[i][:80]}...")
+    print(f"   Tokens  : {train_sequences[i][:15]}...")
+    print()
+
+# ============================================================
+# Padding: ทำให้ทุก sequence มีความยาวเท่ากัน
+# ============================================================
+train_padded = tf.keras.preprocessing.sequence.pad_sequences(
+    train_sequences,
+    maxlen=MAX_LENGTH,      # ความยาวสูงสุด
+    padding='post',         # เติม 0 ต่อท้าย
+    truncating='post'       # ตัดส่วนท้ายถ้ายาวเกิน
+)
+val_padded = tf.keras.preprocessing.sequence.pad_sequences(
+    val_sequences, maxlen=MAX_LENGTH, padding='post', truncating='post'
+)
+test_padded = tf.keras.preprocessing.sequence.pad_sequences(
+    test_sequences, maxlen=MAX_LENGTH, padding='post', truncating='post'
+)
+
+print(f"\\n📐 Shape after Padding:")
+print(f"   Train : {train_padded.shape}")
+print(f"   Val   : {val_padded.shape}")
+print(f"   Test  : {test_padded.shape}")
+
+print(f"\\n📝 ตัวอย่าง Padded Sequence:")
+print(f"   {train_padded[0][:20]}... (แสดง 20 ตัวแรก)")
+"""
+))
+
+# ============================================================
+# 8. tf.data Pipeline & Train/Val/Test
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 8: สร้าง tf.data Pipeline (เพื่อความเร็วในการ Train)
+
+ใช้ `tf.data.Dataset` แทนการส่ง numpy array ตรงๆ เพื่อ:
+- **`.cache()`** → เก็บข้อมูลใน RAM หลัง epoch แรก ไม่ต้อง preprocess ซ้ำ
+- **`.prefetch(AUTOTUNE)`** → โหลดข้อมูล batch ถัดไปล่วงหน้าขณะที่ GPU กำลังประมวลผล
+- **`.shuffle()`** → สุ่มข้อมูลทุก epoch
+- ลด I/O bottleneck → Train เร็วขึ้นอย่างมาก
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# 🚀 สร้าง tf.data.Dataset เพื่อเร่งความเร็ว Training
+# ============================================================
+AUTOTUNE = tf.data.AUTOTUNE  # ให้ TensorFlow กำหนดค่าที่เหมาะสมอัตโนมัติ
+
+# Training dataset: shuffle + batch + cache + prefetch
+train_dataset = tf.data.Dataset.from_tensor_slices((train_padded, y_train))
+train_dataset = (train_dataset
+    .shuffle(buffer_size=len(train_padded))  # สุ่มข้อมูลทุก epoch
+    .batch(BATCH_SIZE)                        # แบ่งเป็น batch
+    .cache()                                  # เก็บใน RAM
+    .prefetch(AUTOTUNE)                       # โหลดล่วงหน้า
+)
+
+# Validation dataset: batch + cache + prefetch (ไม่ต้อง shuffle)
+val_dataset = tf.data.Dataset.from_tensor_slices((val_padded, y_val))
+val_dataset = val_dataset.batch(BATCH_SIZE).cache().prefetch(AUTOTUNE)
+
+# Test dataset: batch + prefetch
+test_dataset = tf.data.Dataset.from_tensor_slices((test_padded, y_test))
+test_dataset = test_dataset.batch(BATCH_SIZE).prefetch(AUTOTUNE)
+
+print("✅ tf.data Pipeline สร้างเสร็จ!")
+print(f"   Train batches : {len(train_dataset)}")
+print(f"   Val batches   : {len(val_dataset)}")
+print(f"   Test batches  : {len(test_dataset)}")
+print(f"   Batch size    : {BATCH_SIZE}")
+print(f"\\n💡 Optimizations: shuffle + batch + cache + prefetch")
+"""
+))
+
+# ============================================================
+# 9. Embedding
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 9: Embedding Layer
+
+**Embedding Layer** แปลง integer token IDs เป็น dense vector representations:
+
+```
+Token ID: 42  →  Embedding  →  [0.12, -0.34, 0.56, ..., 0.78]  (64 dimensions)
+```
+
+### ทำไมต้องใช้ Embedding?
+- **One-hot encoding** ใช้ memory มาก (vector ขนาด 10,000 ต่อคำ)
+- **Embedding** ลดมิติ (vector ขนาด 64 ต่อคำ) และเรียนรู้ความสัมพันธ์ระหว่างคำ
+- คำที่มีความหมายใกล้เคียงกันจะมี embedding vector ที่ใกล้เคียงกัน
+
+### Parameters ที่ใช้:
+- `input_dim = VOCAB_SIZE (10000)` — จำนวนคำใน vocabulary
+- `output_dim = EMBEDDING_DIM (64)` — ขนาดของ embedding vector
+- `input_length = MAX_LENGTH (200)` — ความยาวของ input sequence
+"""
+))
+
+# ============================================================
+# 10. SimpleRNN Model
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 10: SimpleRNN
+
+**SimpleRNN** ประมวลผลข้อมูลตามลำดับเวลา (time step) แต่ละ step รับ input ปัจจุบันและ hidden state จาก step ก่อนหน้า:
+
+```
+x1 → RNN → h1
+              ↓
+x2 → RNN → h2
+              ↓
+x3 → RNN → h3
+              ↓
+           Output
+```
+
+### สูตร: `h_t = tanh(W_x * x_t + W_h * h_{t-1} + b)`
+
+### ข้อดี:
+- โครงสร้างง่าย คำนวณเร็ว
+- Parameters น้อย
+
+### ข้อจำกัด:
+- เกิดปัญหา **Vanishing Gradient** ทำให้จำข้อมูลระยะยาวไม่ดี
+- ไม่เหมาะกับ sequence ที่ยาวมาก
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# สร้างฟังก์ชันสำหรับ build model (ใช้ได้กับทั้ง SimpleRNN, LSTM, GRU)
+# ============================================================
+# จำนวน classes สำหรับ BBC News
+NUM_CLASSES = len(label_names)  # 5 classes
+
+def build_model(rnn_type='SimpleRNN', rnn_units=32, dense_units=128,
+                vocab_size=VOCAB_SIZE, embed_dim=EMBEDDING_DIM,
+                max_len=MAX_LENGTH, num_classes=NUM_CLASSES,
+                dropout1=0.20, dropout2=0.30, name=None):
+    \"\"\"
+    สร้าง RNN model ตาม architecture ที่กำหนด (%4 = 1):
+    
+    Embedding → RNN Layer (32) → Dropout(0.20) → Dense(128, ReLU) → Dropout(0.30) → Dense(5, Softmax)
+    
+    Parameters:
+    - rnn_type: 'SimpleRNN', 'LSTM', หรือ 'GRU'
+    - rnn_units: จำนวน units ใน Recurrent Layer
+    - dense_units: จำนวน units ใน Dense Layer
+    \"\"\"
+    model = keras.Sequential(name=name or rnn_type)
+    
+    # 1) Embedding Layer: แปลง token IDs เป็น dense vectors
+    model.add(layers.Embedding(
+        input_dim=vocab_size,     # ขนาด vocabulary
+        output_dim=embed_dim,     # ขนาด embedding vector
+        input_length=max_len,     # ความยาว input sequence
+        name='embedding'
+    ))
+    
+    # 2) Recurrent Layer: ประมวลผล sequence
+    if rnn_type == 'SimpleRNN':
+        model.add(layers.SimpleRNN(rnn_units, name='simple_rnn'))
+    elif rnn_type == 'LSTM':
+        # LSTM: มี memory cell + 3 gates (forget, input, output)
+        model.add(layers.LSTM(rnn_units, name='lstm'))
+    elif rnn_type == 'GRU':
+        # GRU: มี 2 gates (reset, update) — ง่ายกว่า LSTM
+        model.add(layers.GRU(rnn_units, name='gru'))
+    
+    # 3) Dropout Layer 1: ป้องกัน overfitting (ปิด 20% ของ neurons)
+    model.add(layers.Dropout(dropout1, name='dropout_1'))
+    
+    # 4) Dense Layer: fully connected layer สำหรับเรียนรู้ features
+    model.add(layers.Dense(dense_units, activation='relu', name='dense'))
+    
+    # 5) Dropout Layer 2: ป้องกัน overfitting เพิ่มเติม (ปิด 30% ของ neurons)
+    model.add(layers.Dropout(dropout2, name='dropout_2'))
+    
+    # 6) Output Layer: Softmax สำหรับ multi-class classification (5 classes)
+    model.add(layers.Dense(num_classes, activation='softmax', name='output'))
+    
+    # Build model เพื่อให้สามารถเรียก summary() และ count_params() ได้
+    model.build(input_shape=(None, max_len))
+    
+    return model
+
+# ============================================================
+# สร้าง SimpleRNN Model
+# ============================================================
+model_rnn = build_model(rnn_type='SimpleRNN', rnn_units=32, dense_units=128, name='SimpleRNN_Model')
+print("=" * 60)
+print("📌 SimpleRNN Model Summary")
+print("=" * 60)
+model_rnn.summary()
+"""
+))
+
+# ============================================================
+# 11. LSTM Model
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 11: LSTM (Long Short-Term Memory)
+
+**LSTM** เพิ่มกลไก **Memory Cell** และ **3 Gates** เพื่อแก้ปัญหา Vanishing Gradient:
+
+### Gates:
+1. **Forget Gate** — ตัดสินใจว่าจะ "ลืม" ข้อมูลเก่าอะไรบ้าง
+2. **Input Gate** — ตัดสินใจว่าจะ "จำ" ข้อมูลใหม่อะไรบ้าง
+3. **Output Gate** — ตัดสินใจว่าจะ "ส่งออก" ข้อมูลอะไร
+
+### ข้อดี:
+- จำข้อมูลระยะยาวได้ดี (Long-term dependencies)
+- แก้ปัญหา Vanishing Gradient
+
+### ข้อเสีย:
+- Parameters มากกว่า SimpleRNN (~4 เท่า)
+- ใช้เวลา train นานกว่า
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# สร้าง LSTM Model
+# ============================================================
+model_lstm = build_model(rnn_type='LSTM', rnn_units=32, dense_units=128, name='LSTM_Model')
+print("=" * 60)
+print("📌 LSTM Model Summary")
+print("=" * 60)
+model_lstm.summary()
+"""
+))
+
+# ============================================================
+# 12. GRU Model
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 12: GRU (Gated Recurrent Unit)
+
+**GRU** เป็น simplified version ของ LSTM ที่มีแค่ **2 Gates**:
+
+### Gates:
+1. **Reset Gate** — ควบคุมว่าจะ "ลืม" hidden state ก่อนหน้ามากแค่ไหน
+2. **Update Gate** — ควบคุมสัดส่วนระหว่าง hidden state เก่ากับใหม่
+
+### ข้อดี:
+- Parameters น้อยกว่า LSTM (ไม่มี memory cell แยก)
+- Train เร็วกว่า LSTM
+- ยังจำข้อมูลระยะยาวได้ดี
+
+### ข้อเสีย:
+- อาจ perform ไม่ดีเท่า LSTM ใน dataset ที่ซับซ้อนมาก
+
+### เปรียบเทียบ Parameters:
+| Model | Gates | Parameters ต่อ unit |
+|-------|-------|---------------------|
+| SimpleRNN | 0 | ~1x |
+| GRU | 2 | ~3x |
+| LSTM | 3 | ~4x |
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# สร้าง GRU Model
+# ============================================================
+model_gru = build_model(rnn_type='GRU', rnn_units=32, dense_units=128, name='GRU_Model')
+print("=" * 60)
+print("📌 GRU Model Summary")
+print("=" * 60)
+model_gru.summary()
+
+# ============================================================
+# เปรียบเทียบจำนวน Parameters ของทั้ง 3 โมเดล
+# ============================================================
+print("\\n" + "=" * 60)
+print("📊 เปรียบเทียบ Parameters")
+print("=" * 60)
+for name, model in [('SimpleRNN', model_rnn), ('LSTM', model_lstm), ('GRU', model_gru)]:
+    trainable = model.count_params()
+    print(f"  {name:12s} : {trainable:,} parameters")
+"""
+))
+
+# ============================================================
+# 13. Dense & Output Layer
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 13: Dense Layer และ Output Layer
+
+### Dense Layer (Fully Connected)
+- `Dense(128, activation='relu')` — เรียนรู้ non-linear features จาก RNN output
+- **ReLU activation**: `f(x) = max(0, x)` — ช่วยให้ network เรียนรู้ non-linear patterns
+
+### Output Layer
+- `Dense(5, activation='softmax')` — 5 neurons สำหรับ 5 classes ของ BBC News
+- **Softmax**: แปลง logits เป็น probability distribution (ผลรวม = 1.0)
+- Class ที่มี probability สูงสุดคือ prediction ของโมเดล
+
+### Dropout Layers
+- `Dropout(0.20)` หลัง RNN — ปิดการทำงาน 20% ของ neurons แบบสุ่ม ≈ เป็นการ regularize
+- `Dropout(0.30)` หลัง Dense — ปิดการทำงาน 30% ของ neurons แบบสุ่ม
+- **ใช้เฉพาะตอน Training** — ตอน Inference/Predict จะใช้ neurons ทุกตัว
+"""
+))
+
+# ============================================================
+# 14. Compile
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 14: Compile โมเดล
+
+### ตั้งค่าการ compile:
+| Parameter | ค่า | คำอธิบาย |
+|-----------|-----|----------|
+| **Optimizer** | Adam | Adaptive learning rate optimizer ที่ได้ผลดีทั่วไป |
+| **Learning Rate** | 0.001 (default) | อัตราการเรียนรู้เริ่มต้น |
+| **Loss Function** | sparse_categorical_crossentropy | สำหรับ multi-class ที่ label เป็น integer |
+| **Metrics** | accuracy | วัดความถูกต้อง |
+
+### ทำไมใช้ `sparse_categorical_crossentropy`?
+- เพราะ labels ของเราเป็น **integer** (0, 1, 2, 3, 4) ไม่ใช่ one-hot encoded
+- ถ้า labels เป็น one-hot ให้ใช้ `categorical_crossentropy` แทน
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# Compile ทั้ง 3 โมเดล
+# ============================================================
+# ใช้ค่า Optimizer, Loss, Metric เหมือนกันทุกโมเดล เพื่อเปรียบเทียบได้อย่างยุติธรรม
+
+LEARNING_RATE = 0.001
+
+for name, model in [('SimpleRNN', model_rnn), ('LSTM', model_lstm), ('GRU', model_gru)]:
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),  # Optimizer: Adam
+        loss='sparse_categorical_crossentropy',  # Loss สำหรับ multi-class (label เป็น int)
+        metrics=['accuracy']                     # วัดค่า accuracy
+    )
+    print(f"✅ {name} compiled — Optimizer: Adam(lr={LEARNING_RATE}), "
+          f"Loss: sparse_categorical_crossentropy")
+
+print(f"\\n📋 Compile Settings:")
+print(f"   Optimizer      : Adam")
+print(f"   Learning Rate  : {LEARNING_RATE}")
+print(f"   Loss Function  : sparse_categorical_crossentropy")
+print(f"   Metrics        : accuracy")
+"""
+))
+
+# ============================================================
+# 15. Fit / Training
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 15: Fit / Training (ฝึกสอนโมเดล)
+
+ฝึกสอนทั้ง 3 โมเดลด้วย:
+- **Epochs**: 15 (จำนวนรอบที่ผ่านข้อมูลทั้งหมด)
+- **Batch Size**: 64 (จำนวนตัวอย่างต่อ 1 step)
+- **Validation Data**: ใช้ validation set สำหรับ monitor overfitting
+- ⏱️ จับเวลา training แต่ละโมเดล เพื่อเปรียบเทียบความเร็ว
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# 🚀 Train ทั้ง 3 โมเดล พร้อมจับเวลา
+# ============================================================
+
+# เก็บ history และเวลา training ของแต่ละโมเดล
+histories = {}
+train_times = {}
+
+models_to_train = [
+    ('SimpleRNN', model_rnn),
+    ('LSTM', model_lstm),
+    ('GRU', model_gru)
+]
+
+for name, model in models_to_train:
+    print(f"\\n{'='*60}")
+    print(f"🏋️ Training {name}...")
+    print(f"{'='*60}")
+    
+    # จับเวลา training
+    start_time = time.time()
+    
+    # ฝึกสอนโมเดล
+    history = model.fit(
+        train_dataset,                    # ใช้ tf.data pipeline ที่ optimize แล้ว
+        validation_data=val_dataset,      # ใช้ validation set
+        epochs=EPOCHS,                    # จำนวนรอบ
+        verbose=1                         # แสดง progress bar
+    )
+    
+    # คำนวณเวลา
+    elapsed = time.time() - start_time
+    
+    # เก็บผลลัพธ์
+    histories[name] = history
+    train_times[name] = elapsed
+    
+    print(f"\\n⏱️ {name} Training Time: {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")
+
+# ============================================================
+# สรุปเวลา Training
+# ============================================================
+print(f"\\n{'='*60}")
+print(f"⏱️ สรุปเวลา Training")
+print(f"{'='*60}")
+for name, t in train_times.items():
+    print(f"  {name:12s} : {t:.2f} sec ({t/60:.2f} min)")
+"""
+))
+
+# ============================================================
+# 16. Accuracy / Loss Graphs
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 16: Accuracy / Loss Graphs
+
+แสดงกราฟ:
+1. **Epoch vs Accuracy** — ดูว่า accuracy เพิ่มขึ้นเรื่อยๆ หรือไม่
+2. **Epoch vs Loss** — ดูว่า loss ลดลงเรื่อยๆ หรือไม่
+
+### สิ่งที่ต้องสังเกต:
+- ถ้า **Training Accuracy สูง แต่ Validation Accuracy ต่ำ** → **Overfitting**
+- ถ้า **ทั้ง Training และ Validation Accuracy ต่ำ** → **Underfitting**
+- ถ้า **ทั้งสองค่าสูงและใกล้เคียงกัน** → **Good fit** ✅
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# 📈 วาดกราฟ Accuracy / Loss ของทั้ง 3 โมเดล
+# ============================================================
+
+fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+model_names = ['SimpleRNN', 'LSTM', 'GRU']
+colors = {'train': '#FF6B6B', 'val': '#4ECDC4'}
+
+for i, name in enumerate(model_names):
+    h = histories[name].history
+    epochs_range = range(1, len(h['accuracy']) + 1)
+    
+    # Accuracy Graph
+    axes[0][i].plot(epochs_range, h['accuracy'], 'o-', color=colors['train'],
+                    label='Training Accuracy', linewidth=2, markersize=4)
+    axes[0][i].plot(epochs_range, h['val_accuracy'], 's-', color=colors['val'],
+                    label='Validation Accuracy', linewidth=2, markersize=4)
+    axes[0][i].set_title(f'{name} — Accuracy', fontsize=14, fontweight='bold')
+    axes[0][i].set_xlabel('Epoch')
+    axes[0][i].set_ylabel('Accuracy')
+    axes[0][i].legend()
+    axes[0][i].grid(True, alpha=0.3)
+    axes[0][i].set_ylim([0, 1.05])
+    
+    # Loss Graph
+    axes[1][i].plot(epochs_range, h['loss'], 'o-', color=colors['train'],
+                    label='Training Loss', linewidth=2, markersize=4)
+    axes[1][i].plot(epochs_range, h['val_loss'], 's-', color=colors['val'],
+                    label='Validation Loss', linewidth=2, markersize=4)
+    axes[1][i].set_title(f'{name} — Loss', fontsize=14, fontweight='bold')
+    axes[1][i].set_xlabel('Epoch')
+    axes[1][i].set_ylabel('Loss')
+    axes[1][i].legend()
+    axes[1][i].grid(True, alpha=0.3)
+
+plt.suptitle('📊 Training & Validation — Accuracy / Loss', fontsize=16, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# กราฟเปรียบเทียบทุกโมเดลในกราฟเดียว
+# ============================================================
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+model_colors = {'SimpleRNN': '#FF6B6B', 'LSTM': '#4ECDC4', 'GRU': '#45B7D1'}
+
+for name in model_names:
+    h = histories[name].history
+    epochs_range = range(1, len(h['accuracy']) + 1)
+    
+    # Validation Accuracy
+    axes[0].plot(epochs_range, h['val_accuracy'], 'o-', color=model_colors[name],
+                 label=name, linewidth=2, markersize=4)
+    
+    # Validation Loss
+    axes[1].plot(epochs_range, h['val_loss'], 'o-', color=model_colors[name],
+                 label=name, linewidth=2, markersize=4)
+
+axes[0].set_title('Validation Accuracy Comparison', fontsize=14, fontweight='bold')
+axes[0].set_xlabel('Epoch')
+axes[0].set_ylabel('Accuracy')
+axes[0].legend(fontsize=12)
+axes[0].grid(True, alpha=0.3)
+
+axes[1].set_title('Validation Loss Comparison', fontsize=14, fontweight='bold')
+axes[1].set_xlabel('Epoch')
+axes[1].set_ylabel('Loss')
+axes[1].legend(fontsize=12)
+axes[1].grid(True, alpha=0.3)
+
+plt.suptitle('📊 Model Comparison — Validation Accuracy & Loss', fontsize=16, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.show()
+"""
+))
+
+# ============================================================
+# 17. Evaluate + Accuracy Summary
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 17: ประเมินผลบน Test Set
+
+ประเมินผลทั้ง 3 โมเดลบน Test Set ที่ไม่เคยเห็นระหว่าง training:
+- **Training Accuracy** — ค่าจากรอบ training สุดท้าย
+- **Validation Accuracy** — ค่าจากรอบ training สุดท้าย
+- **Test Accuracy** — ประเมินบน test set
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# 📊 Evaluate ทั้ง 3 โมเดลบน Test Set
+# ============================================================
+results = {}
+
+print("=" * 70)
+print("📊 Evaluation Results on Test Set")
+print("=" * 70)
+
+for name, model in models_to_train:
+    # Evaluate บน test set
+    test_loss, test_acc = model.evaluate(test_dataset, verbose=0)
+    
+    h = histories[name].history
+    train_acc = h['accuracy'][-1]
+    val_acc = h['val_accuracy'][-1]
+    train_loss = h['loss'][-1]
+    val_loss = h['val_loss'][-1]
+    
+    results[name] = {
+        'train_acc': train_acc,
+        'val_acc': val_acc,
+        'test_acc': test_acc,
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'test_loss': test_loss,
+        'params': model.count_params(),
+        'time': train_times[name]
+    }
+    
+    print(f"\\n🏷️ {name}:")
+    print(f"   Training Accuracy   : {train_acc*100:.2f}%")
+    print(f"   Validation Accuracy : {val_acc*100:.2f}%")
+    print(f"   Test Accuracy       : {test_acc*100:.2f}%")
+    print(f"   Training Loss       : {train_loss:.4f}")
+    print(f"   Validation Loss     : {val_loss:.4f}")
+    print(f"   Test Loss           : {test_loss:.4f}")
+    print(f"   Parameters          : {model.count_params():,}")
+    print(f"   Training Time       : {train_times[name]:.2f} sec")
+
+# ============================================================
+# สร้างตารางเปรียบเทียบ
+# ============================================================
+print(f"\\n{'='*70}")
+print("📋 Summary Table")
+print(f"{'='*70}")
+print(f"{'Model':<12} {'Params':>10} {'Time (s)':>10} {'Train Acc':>10} {'Val Acc':>10} {'Test Acc':>10}")
+print("-" * 70)
+for name in model_names:
+    r = results[name]
+    print(f"{name:<12} {r['params']:>10,} {r['time']:>10.2f} "
+          f"{r['train_acc']*100:>9.2f}% {r['val_acc']*100:>9.2f}% {r['test_acc']*100:>9.2f}%")
+"""
+))
+
+# ============================================================
+# 18. Confusion Matrix
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 18: Confusion Matrix
+
+**Confusion Matrix** แสดงผลการจำแนกของโมเดลเทียบกับค่าจริง:
+
+### สำหรับ Multi-class:
+- **แนวตั้ง (Actual)** = class จริง
+- **แนวนอน (Predicted)** = class ที่โมเดลทำนาย
+- **ค่าบนเส้นทแยง** = จำนวนที่ทำนายถูก (True Predictions)
+- **ค่านอกเส้นทแยง** = จำนวนที่ทำนายผิด (Misclassifications)
+
+### สำหรับแต่ละ class:
+- **True Positive (TP)** — ทำนายว่าเป็น class นี้ และถูกต้อง
+- **True Negative (TN)** — ทำนายว่าไม่ใช่ class นี้ และถูกต้อง
+- **False Positive (FP)** — ทำนายว่าเป็น class นี้ แต่จริงๆ ไม่ใช่
+- **False Negative (FN)** — ทำนายว่าไม่ใช่ class นี้ แต่จริงๆ ใช่
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# 📊 Confusion Matrix สำหรับทั้ง 3 โมเดล
+# ============================================================
+
+fig, axes = plt.subplots(1, 3, figsize=(22, 6))
+
+for i, (name, model) in enumerate(models_to_train):
+    # ทำนายผลบน test set
+    y_pred_probs = model.predict(test_dataset, verbose=0)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    
+    # สร้าง confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    
+    # วาด heatmap
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[i],
+                xticklabels=label_names, yticklabels=label_names)
+    axes[i].set_title(f'{name} — Confusion Matrix', fontsize=14, fontweight='bold')
+    axes[i].set_xlabel('Predicted')
+    axes[i].set_ylabel('Actual')
+
+plt.suptitle('📊 Confusion Matrix — Test Set', fontsize=16, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# อธิบาย Confusion Matrix ของโมเดลที่ดีที่สุด
+# ============================================================
+# เลือกโมเดลที่ test accuracy สูงที่สุด
+best_model_name = max(results, key=lambda x: results[x]['test_acc'])
+best_model = dict(models_to_train)[best_model_name]
+
+y_pred_probs = best_model.predict(test_dataset, verbose=0)
+y_pred_best = np.argmax(y_pred_probs, axis=1)
+cm_best = confusion_matrix(y_test, y_pred_best)
+
+print(f"\\n📌 วิเคราะห์ Confusion Matrix ของ {best_model_name} (โมเดลที่ดีที่สุด):")
+print("=" * 60)
+for i, class_name in enumerate(label_names):
+    tp = cm_best[i, i]
+    fp = cm_best[:, i].sum() - tp
+    fn = cm_best[i, :].sum() - tp
+    tn = cm_best.sum() - tp - fp - fn
+    print(f"\\n  🏷️ Class: {class_name}")
+    print(f"     True Positive  (TP) = {tp:3d}  (ทำนายถูก ว่าเป็น {class_name})")
+    print(f"     True Negative  (TN) = {tn:3d}  (ทำนายถูก ว่าไม่ใช่ {class_name})")
+    print(f"     False Positive (FP) = {fp:3d}  (ทำนายผิด ว่าเป็น {class_name} แต่จริงๆ ไม่ใช่)")
+    print(f"     False Negative (FN) = {fn:3d}  (ทำนายผิด ว่าไม่ใช่ {class_name} แต่จริงๆ ใช่)")
+"""
+))
+
+# ============================================================
+# 19. Classification Report
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 19: Classification Report
+
+แสดงค่า:
+- **Precision** — ในจำนวนที่ทำนายว่าเป็น class นี้ มีกี่เปอร์เซ็นต์ที่ถูก
+- **Recall** — ในจำนวน class นี้จริงๆ โมเดลทำนายถูกกี่เปอร์เซ็นต์
+- **F1-score** — ค่าเฉลี่ยฮาร์โมนิกของ Precision กับ Recall
+- **Support** — จำนวนตัวอย่างจริงในแต่ละ class
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# 📊 Classification Report สำหรับทั้ง 3 โมเดล
+# ============================================================
+
+for name, model in models_to_train:
+    y_pred_probs = model.predict(test_dataset, verbose=0)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    
+    print(f"\\n{'='*60}")
+    print(f"📋 Classification Report — {name}")
+    print(f"{'='*60}")
+    print(classification_report(y_test, y_pred, target_names=label_names, digits=4))
+"""
+))
+
+# ============================================================
+# 20. Predict ข้อความใหม่
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 20: Predict ข้อความใหม่
+
+ทดลองให้โมเดลทำนาย class ของข้อความที่สร้างขึ้นใหม่ อย่างน้อย 5 ข้อความ แสดงผล:
+- Input Text
+- Predicted Class
+- Confidence (Probability)
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# 🔮 Predict ข้อความใหม่ 5 ข้อความ
+# ============================================================
+
+# สร้างข้อความใหม่ 5 ข้อความ (ครอบคลุมทุก class)
+new_texts = [
+    "The stock market saw a significant decline today as investors worried about inflation and rising interest rates affecting the economy.",
+    "The new superhero movie broke box office records this weekend with millions of fans flocking to cinemas worldwide.",
+    "The prime minister announced new policies on healthcare reform during the parliamentary debate yesterday.",
+    "Manchester United secured a dramatic victory in the Champions League final with a last minute goal.",
+    "Apple unveiled its latest artificial intelligence chip that promises to revolutionize smartphone computing power."
+]
+
+# ข้อความที่คาดหวัง (ground truth)
+expected_classes = ['business', 'entertainment', 'politics', 'sport', 'tech']
+
+def predict_texts(model, model_name, texts):
+    \"\"\"ทำนาย class ของข้อความใหม่\"\"\"
+    # 1) ทำความสะอาดข้อความ
+    cleaned = [clean_text(t) for t in texts]
+    
+    # 2) แปลงเป็น sequence
+    sequences = tokenizer.texts_to_sequences(cleaned)
+    
+    # 3) Padding
+    padded = tf.keras.preprocessing.sequence.pad_sequences(
+        sequences, maxlen=MAX_LENGTH, padding='post', truncating='post'
+    )
+    
+    # 4) ทำนาย
+    predictions = model.predict(padded, verbose=0)
+    
+    print(f"\\n{'='*70}")
+    print(f"🔮 Predictions — {model_name}")
+    print(f"{'='*70}")
+    
+    for i, (text, pred, expected) in enumerate(zip(texts, predictions, expected_classes)):
+        pred_class_id = np.argmax(pred)
+        pred_class = id_to_label[pred_class_id]
+        confidence = pred[pred_class_id] * 100
+        status = "✅" if pred_class == expected else "❌"
+        
+        print(f"\\n  📝 Text {i+1}: {text[:80]}...")
+        print(f"     Expected  : {expected}")
+        print(f"     Predicted : {pred_class} {status}")
+        print(f"     Confidence: {confidence:.2f}%")
+        print(f"     Probs     : {', '.join([f'{label_names[j]}:{pred[j]*100:.1f}%' for j in range(len(label_names))])}")
+
+# ใช้โมเดลที่ดีที่สุดในการ predict
+predict_texts(best_model, best_model_name, new_texts)
+"""
+))
+
+# ============================================================
+# 21. Overfitting / Underfitting Analysis
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 21: วิเคราะห์ Overfitting / Underfitting
+
+### สิ่งที่ต้องพิจารณา:
+| สถานการณ์ | Train Acc | Val Acc | หมายความว่า |
+|-----------|-----------|---------|-------------|
+| **Good Fit** ✅ | สูง | สูง (ใกล้เคียง Train) | โมเดลเรียนรู้ได้ดี |
+| **Overfitting** ⚠️ | สูงมาก | ต่ำกว่า Train มาก | โมเดลท่องจำ training data |
+| **Underfitting** ❌ | ต่ำ | ต่ำ | โมเดลเรียนรู้ไม่เพียงพอ |
+
+### วิธีแก้ Overfitting:
+- เพิ่ม Dropout rate
+- ลดจำนวน units / parameters
+- ใช้ Early Stopping
+- เพิ่มข้อมูล training
+- ลด Vocabulary Size / Sequence Length
+
+### วิธีแก้ Underfitting:
+- เพิ่มจำนวน units / parameters
+- เพิ่มจำนวน epochs
+- ลด Dropout rate
+- เพิ่ม Vocabulary Size / Sequence Length
+- ใช้โมเดลที่ซับซ้อนกว่า (LSTM/GRU แทน SimpleRNN)
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# 📊 วิเคราะห์ Overfitting / Underfitting
+# ============================================================
+
+print("=" * 70)
+print("📊 Overfitting / Underfitting Analysis")
+print("=" * 70)
+
+for name in model_names:
+    r = results[name]
+    gap = r['train_acc'] - r['val_acc']
+    loss_gap = r['val_loss'] - r['train_loss']
+    
+    print(f"\\n🏷️ {name}:")
+    print(f"   Training Accuracy   = {r['train_acc']*100:.2f}%")
+    print(f"   Validation Accuracy = {r['val_acc']*100:.2f}%")
+    print(f"   Gap (Train - Val)   = {gap*100:.2f}%")
+    print(f"   Training Loss       = {r['train_loss']:.4f}")
+    print(f"   Validation Loss     = {r['val_loss']:.4f}")
+    print(f"   Loss Gap (Val-Train)= {loss_gap:.4f}")
+    
+    if gap > 0.10:
+        print(f"   ⚠️ สถานะ: OVERFITTING — Train Acc สูงกว่า Val Acc มากกว่า 10%")
+        print(f"   💡 แนวทางปรับปรุง: เพิ่ม Dropout, ใช้ Early Stopping, ลด model complexity")
+    elif r['val_acc'] < 0.70:
+        print(f"   ❌ สถานะ: UNDERFITTING — Validation Accuracy ต่ำกว่า 70%")
+        print(f"   💡 แนวทางปรับปรุง: เพิ่ม epochs, เพิ่ม units, ใช้ LSTM/GRU")
+    else:
+        print(f"   ✅ สถานะ: GOOD FIT — โมเดลเรียนรู้ได้ดี")
+
+# วาดกราฟ gap analysis
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for name in model_names:
+    h = histories[name].history
+    epochs_range = range(1, len(h['accuracy']) + 1)
+    gap = [t - v for t, v in zip(h['accuracy'], h['val_accuracy'])]
+    loss_gap = [v - t for t, v in zip(h['loss'], h['val_loss'])]
+    
+    axes[0].plot(epochs_range, gap, 'o-', label=name, linewidth=2, markersize=4)
+    axes[1].plot(epochs_range, loss_gap, 'o-', label=name, linewidth=2, markersize=4)
+
+axes[0].axhline(y=0.10, color='red', linestyle='--', alpha=0.5, label='Overfitting threshold (10%)')
+axes[0].axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+axes[0].set_title('Accuracy Gap (Train - Val)', fontsize=14, fontweight='bold')
+axes[0].set_xlabel('Epoch')
+axes[0].set_ylabel('Gap')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+axes[1].axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+axes[1].set_title('Loss Gap (Val - Train)', fontsize=14, fontweight='bold')
+axes[1].set_xlabel('Epoch')
+axes[1].set_ylabel('Gap')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.suptitle('📊 Overfitting Analysis', fontsize=16, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.show()
+"""
+))
+
+# ============================================================
+# 22. Hyperparameter Experiment
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 22: Hyperparameter Experiment
+
+ทดลองปรับ Hyperparameter อย่างน้อย 3 ค่า แล้วเปรียบเทียบผล:
+
+| Experiment | สิ่งที่เปลี่ยน | คำอธิบาย |
+|------------|---------------|----------|
+| **Baseline** | ค่าเริ่มต้น | RNN=32, Dense=128, Embed=64, LR=0.001, Dropout=0.20/0.30 |
+| **Exp 1** | Embedding Dim = 128 | เพิ่มขนาด embedding vector |
+| **Exp 2** | Dropout = 0.40/0.50 | เพิ่ม regularization |
+| **Exp 3** | Learning Rate = 0.0005 | ลด learning rate |
+
+> ใช้ GRU เป็นตัวทดสอบ (เพราะมักให้ผลดีและ train เร็ว)
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# 🔬 Hyperparameter Experiment (อย่างน้อย 3 การทดลอง)
+# ============================================================
+
+# ใช้ GRU เป็น base model สำหรับทดลอง
+experiments = {
+    'Baseline': {
+        'rnn_units': 32, 'dense_units': 128, 'embed_dim': 64,
+        'dropout1': 0.20, 'dropout2': 0.30, 'lr': 0.001, 'epochs': 10
+    },
+    'Exp1_EmbDim128': {
+        'rnn_units': 32, 'dense_units': 128, 'embed_dim': 128,  # เปลี่ยน embedding dim
+        'dropout1': 0.20, 'dropout2': 0.30, 'lr': 0.001, 'epochs': 10
+    },
+    'Exp2_HighDropout': {
+        'rnn_units': 32, 'dense_units': 128, 'embed_dim': 64,
+        'dropout1': 0.40, 'dropout2': 0.50, 'lr': 0.001, 'epochs': 10  # เพิ่ม dropout
+    },
+    'Exp3_LowLR': {
+        'rnn_units': 32, 'dense_units': 128, 'embed_dim': 64,
+        'dropout1': 0.20, 'dropout2': 0.30, 'lr': 0.0005, 'epochs': 10  # ลด learning rate
+    },
+}
+
+exp_results = {}
+
+for exp_name, params in experiments.items():
+    print(f"\\n{'='*60}")
+    print(f"🔬 {exp_name}: units={params['rnn_units']}, embed={params['embed_dim']}, "
+          f"dropout={params['dropout1']}/{params['dropout2']}, lr={params['lr']}")
+    print(f"{'='*60}")
+    
+    # สร้างโมเดลใหม่
+    exp_model = build_model(
+        rnn_type='GRU',
+        rnn_units=params['rnn_units'],
+        dense_units=params['dense_units'],
+        embed_dim=params['embed_dim'],
+        dropout1=params['dropout1'],
+        dropout2=params['dropout2'],
+        name=f'GRU_{exp_name}'
+    )
+    
+    # Compile
+    exp_model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=params['lr']),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    # Train
+    start_time = time.time()
+    exp_history = exp_model.fit(
+        train_dataset,
+        validation_data=val_dataset,
+        epochs=params['epochs'],
+        verbose=0  # ซ่อน progress bar เพื่อความสะอาด
+    )
+    exp_time = time.time() - start_time
+    
+    # Evaluate
+    test_loss, test_acc = exp_model.evaluate(test_dataset, verbose=0)
+    
+    exp_results[exp_name] = {
+        'params': params,
+        'test_acc': test_acc,
+        'val_acc': exp_history.history['val_accuracy'][-1],
+        'train_acc': exp_history.history['accuracy'][-1],
+        'test_loss': test_loss,
+        'time': exp_time,
+        'model_params': exp_model.count_params()
+    }
+    
+    print(f"   Train Acc  : {exp_results[exp_name]['train_acc']*100:.2f}%")
+    print(f"   Val Acc    : {exp_results[exp_name]['val_acc']*100:.2f}%")
+    print(f"   Test Acc   : {test_acc*100:.2f}%")
+    print(f"   Time       : {exp_time:.2f} sec")
+    
+    # ลบ model เพื่อประหยัด memory
+    del exp_model
+    tf.keras.backend.clear_session()
+
+# ============================================================
+# ตารางเปรียบเทียบ Hyperparameter Experiment
+# ============================================================
+print(f"\\n{'='*90}")
+print("📊 Hyperparameter Experiment Results")
+print(f"{'='*90}")
+print(f"{'Experiment':<20} {'RNN':>5} {'Embed':>6} {'Drop':>10} {'LR':>8} "
+      f"{'Train%':>8} {'Val%':>8} {'Test%':>8} {'Time(s)':>8}")
+print("-" * 90)
+for exp_name, r in exp_results.items():
+    p = r['params']
+    print(f"{exp_name:<20} {p['rnn_units']:>5} {p['embed_dim']:>6} "
+          f"{p['dropout1']:.2f}/{p['dropout2']:.2f} {p['lr']:>8.4f} "
+          f"{r['train_acc']*100:>7.2f}% {r['val_acc']*100:>7.2f}% "
+          f"{r['test_acc']*100:>7.2f}% {r['time']:>7.2f}")
+
+# วิเคราะห์ผล
+print(f"\\n📝 วิเคราะห์ผล Hyperparameter Experiment:")
+best_exp = max(exp_results, key=lambda x: exp_results[x]['test_acc'])
+print(f"   🏆 การทดลองที่ดีที่สุด: {best_exp} (Test Acc: {exp_results[best_exp]['test_acc']*100:.2f}%)")
+print(f"\\n   1) Embedding Dim 128 vs 64:")
+print(f"      - Embedding ที่ใหญ่กว่าช่วยให้แต่ละคำมี representation ที่ละเอียดขึ้น")
+print(f"   2) High Dropout (0.40/0.50):")
+print(f"      - Dropout สูงช่วยลด overfitting แต่อาจทำให้เรียนรู้ช้าลง")
+print(f"   3) Low Learning Rate (0.0005):")
+print(f"      - LR ต่ำทำให้การเรียนรู้ละเอียดขึ้น แต่ต้องใช้ epochs มากขึ้น")
+"""
+))
+
+# ============================================================
+# 23. เปรียบเทียบ SimpleRNN / LSTM / GRU
+# ============================================================
+cells.append(md(
+"""---
+## 📌 หัวข้อที่ 23: เปรียบเทียบ SimpleRNN / LSTM / GRU — สรุปผล
+
+### ความแตกต่างทางโครงสร้าง:
+
+| คุณสมบัติ | SimpleRNN | LSTM | GRU |
+|-----------|-----------|------|-----|
+| **Gates** | ไม่มี | 3 (Forget, Input, Output) | 2 (Reset, Update) |
+| **Memory Cell** | ไม่มี | มี (แยก cell state) | ไม่มี (ใช้ hidden state) |
+| **Vanishing Gradient** | มีปัญหา | แก้ได้ | แก้ได้ |
+| **Parameters** | น้อยสุด | มากสุด (~4x) | ปานกลาง (~3x) |
+| **Training Speed** | เร็วสุด | ช้าสุด | ปานกลาง |
+| **Long-term Memory** | ไม่ดี | ดีมาก | ดี |
+"""
+))
+
+cells.append(code(
+"""# ============================================================
+# 📊 เปรียบเทียบ SimpleRNN / LSTM / GRU — Final Summary
+# ============================================================
+
+print("=" * 80)
+print("📊 FINAL COMPARISON: SimpleRNN vs LSTM vs GRU")
+print("=" * 80)
+
+# สร้าง DataFrame สรุปผล
+comparison_data = []
+for name in model_names:
+    r = results[name]
+    comparison_data.append({
+        'Model': name,
+        'Parameters': f"{r['params']:,}",
+        'Training Time (sec)': f"{r['time']:.2f}",
+        'Training Accuracy': f"{r['train_acc']*100:.2f}%",
+        'Validation Accuracy': f"{r['val_acc']*100:.2f}%",
+        'Test Accuracy': f"{r['test_acc']*100:.2f}%",
+        'Test Loss': f"{r['test_loss']:.4f}",
+    })
+
+comparison_df = pd.DataFrame(comparison_data)
+print(comparison_df.to_string(index=False))
+
+# ============================================================
+# กราฟเปรียบเทียบ
+# ============================================================
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+# 1) Test Accuracy
+accs = [results[n]['test_acc']*100 for n in model_names]
+bars1 = axes[0].bar(model_names, accs, color=['#FF6B6B', '#4ECDC4', '#45B7D1'],
+                     edgecolor='black', linewidth=0.5)
+axes[0].set_title('Test Accuracy (%)', fontsize=14, fontweight='bold')
+axes[0].set_ylim([0, 100])
+for bar, acc in zip(bars1, accs):
+    axes[0].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1,
+                 f'{acc:.1f}%', ha='center', va='bottom', fontweight='bold')
+
+# 2) Parameters
+params = [results[n]['params'] for n in model_names]
+bars2 = axes[1].bar(model_names, params, color=['#FF6B6B', '#4ECDC4', '#45B7D1'],
+                     edgecolor='black', linewidth=0.5)
+axes[1].set_title('Number of Parameters', fontsize=14, fontweight='bold')
+for bar, p in zip(bars2, params):
+    axes[1].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 100,
+                 f'{p:,}', ha='center', va='bottom', fontweight='bold', fontsize=9)
+
+# 3) Training Time
+times = [results[n]['time'] for n in model_names]
+bars3 = axes[2].bar(model_names, times, color=['#FF6B6B', '#4ECDC4', '#45B7D1'],
+                     edgecolor='black', linewidth=0.5)
+axes[2].set_title('Training Time (seconds)', fontsize=14, fontweight='bold')
+for bar, t in zip(bars3, times):
+    axes[2].text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.5,
+                 f'{t:.1f}s', ha='center', va='bottom', fontweight='bold')
+
+plt.suptitle('📊 SimpleRNN vs LSTM vs GRU — Comparison', fontsize=16, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 📝 สรุปวิเคราะห์ผล
+# ============================================================
+best_name = max(results, key=lambda x: results[x]['test_acc'])
+fastest_name = min(results, key=lambda x: results[x]['time'])
+least_params_name = min(results, key=lambda x: results[x]['params'])
+
+print(f"\\n{'='*80}")
+print("📝 สรุปวิเคราะห์ผล")
+print(f"{'='*80}")
+print(f"\\n🏆 โมเดลที่ Test Accuracy สูงสุด  : {best_name} ({results[best_name]['test_acc']*100:.2f}%)")
+print(f"⚡ โมเดลที่ Train เร็วสุด          : {fastest_name} ({results[fastest_name]['time']:.2f} sec)")
+print(f"📦 โมเดลที่ Parameters น้อยสุด     : {least_params_name} ({results[least_params_name]['params']:,})")
+
+print("\\n📌 วิเคราะห์ความแตกต่าง:")
+print("\\n1. SimpleRNN:")
+print("   - Parameters น้อยที่สุด → train เร็วที่สุด")
+print("   - แต่ไม่มี gate mechanism → จำข้อมูลระยะยาวไม่ดี")
+print("   - เกิด Vanishing Gradient → accuracy อาจต่ำกว่า LSTM/GRU")
+print("\\n2. LSTM:")
+print("   - Parameters มากที่สุด (~4x ของ SimpleRNN) → train ช้าสุด")
+print("   - มี Memory Cell + 3 Gates → จำข้อมูลระยะยาวได้ดีมาก")
+print("   - เหมาะกับ sequence ที่ยาวและ dependency ซับซ้อน")
+print("\\n3. GRU:")
+print("   - Parameters ปานกลาง (~3x ของ SimpleRNN) → train เร็วกว่า LSTM")
+print("   - มี 2 Gates → จำข้อมูลระยะยาวได้ดี (แม้จะน้อยกว่า LSTM เล็กน้อย)")
+print("   - มักให้ผลดีเทียบเท่า LSTM แต่ใช้ทรัพยากรน้อยกว่า")
+print("\\n4. สำหรับ BBC News Dataset:")
+print("   - บทความข่าวมีความยาวปานกลาง → LSTM/GRU ได้เปรียบ SimpleRNN")
+print(f"   - โมเดลที่เหมาะสมที่สุดคือ {best_name}")
+print(f"   - เพราะให้ Test Accuracy สูงสุดที่ {results[best_name]['test_acc']*100:.2f}%")
+"""
+))
+
+# ============================================================
+# 24. Complete Summary
+# ============================================================
+cells.append(md(
+"""---
+## 📌 สรุปท้าย Lab 5
+
+### สิ่งที่ทำในแลบนี้:
+1. ✅ โหลดและวิเคราะห์ **BBC News Dataset** (5 classes, ~2,225 articles)
+2. ✅ **Text Preprocessing**: Cleaning → Tokenization → Vocabulary → Padding
+3. ✅ แบ่ง **Train 70% / Validation 15% / Test 15%**
+4. ✅ สร้าง **3 โมเดล**: SimpleRNN, LSTM, GRU (Recurrent Units=32, Dense=128)
+5. ✅ **Compile & Train** ด้วย Adam optimizer + sparse_categorical_crossentropy
+6. ✅ แสดง **Accuracy/Loss Graph** ของทั้ง 3 โมเดล
+7. ✅ สร้าง **Confusion Matrix** พร้อมอธิบาย TP, TN, FP, FN
+8. ✅ แสดง **Classification Report** (Precision, Recall, F1-score)
+9. ✅ **Predict ข้อความใหม่** 5 ข้อความ พร้อม Confidence
+10. ✅ วิเคราะห์ **Overfitting / Underfitting**
+11. ✅ ทดลอง **Hyperparameter Experiment** 3 การทดลอง
+12. ✅ **เปรียบเทียบ SimpleRNN / LSTM / GRU** พร้อมวิเคราะห์ผล
+
+### Speed Optimizations ที่ใช้:
+- ✅ GPU memory growth / CPU threading
+- ✅ XLA JIT Compiler
+- ✅ `tf.data` pipeline: `.shuffle().batch().cache().prefetch(AUTOTUNE)`
+- ✅ CuDNN-optimized LSTM/GRU (อัตโนมัติเมื่อมี GPU)
+"""
+))
+
+# ============================================================
+# BUILD NOTEBOOK
+# ============================================================
+notebook = {
+    "nbformat": 4,
+    "nbformat_minor": 5,
+    "metadata": {
+        "kernelspec": {
+            "display_name": "Python 3",
+            "language": "python",
+            "name": "python3"
+        },
+        "language_info": {
+            "name": "python",
+            "version": "3.12.0",
+            "codemirror_mode": {"name": "ipython", "version": 3},
+            "file_extension": ".py",
+            "mimetype": "text/x-python",
+            "nbconvert_exporter": "python",
+            "pygments_lexer": "ipython3"
+        }
+    },
+    "cells": cells
+}
+
+output_path = "lab5_bbc_news_029.ipynb"
+with open(output_path, "w", encoding="utf-8") as f:
+    json.dump(notebook, f, ensure_ascii=False, indent=1)
+
+print(f"[OK] Notebook created: {output_path}")
+print(f"   Total cells: {len(cells)}")
+print(f"   Markdown cells: {sum(1 for c in cells if c['cell_type'] == 'markdown')}")
+print(f"   Code cells: {sum(1 for c in cells if c['cell_type'] == 'code')}")
